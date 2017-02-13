@@ -20,16 +20,8 @@
 #
 
 #
-class Chef::Resource # rubocop:disable all
+class Chef::Resource
   include Opscode::RabbitMQ # rubocop:enable all
-end
-
-case node['platform_family']
-when  'rhel', 'fedora'
-  if node['platform_version'].to_f >= 7.0
-    include_recipe 'yum-epel'
-    include_recipe 'yum-erlang_solutions'
-  end
 end
 
 include_recipe 'erlang'
@@ -37,8 +29,24 @@ include_recipe 'erlang'
 ## Install the package
 case node['platform_family']
 when 'debian'
+
+  template '/etc/apt/apt.conf.d/90forceyes' do
+    source '90forceyes.erb'
+    owner 'root'
+    group 'root'
+    mode '0644'
+  end
+
   # logrotate is a package dependency of rabbitmq-server
   package 'logrotate'
+
+  # socat is a package dependency of rabbitmq-server
+  package 'socat'
+
+  # => Prevent Debian systems from automatically starting RabbitMQ after dpkg install
+  dpkg_autostart node['rabbitmq']['service_name'] do
+    allow false
+  end
 
   if node['rabbitmq']['use_distro_version']
     package 'rabbitmq-server' do
@@ -47,18 +55,20 @@ when 'debian'
     end
   else
     # we need to download the package
-    deb_package = "https://www.rabbitmq.com/releases/rabbitmq-server/v#{node['rabbitmq']['version']}/rabbitmq-server_#{node['rabbitmq']['version']}-1_all.deb"
-    remote_file "#{Chef::Config[:file_cache_path]}/rabbitmq-server_#{node['rabbitmq']['version']}-1_all.deb" do
+    deb_package = "#{node['rabbitmq']['deb_package_url']}#{node['rabbitmq']['deb_package']}"
+    remote_file "#{Chef::Config[:file_cache_path]}/#{node['rabbitmq']['deb_package']}" do
       source deb_package
       action :create_if_missing
     end
-    dpkg_package "#{Chef::Config[:file_cache_path]}/rabbitmq-server_#{node['rabbitmq']['version']}-1_all.deb" do
-      action :install
+    package 'rabbitmq-server' do
+      provider Chef::Provider::Package::Dpkg
+      source ::File.join(Chef::Config[:file_cache_path], node['rabbitmq']['deb_package'])
+      action :upgrade
     end
   end
 
   # Configure job control
-  if node['rabbitmq']['job_control'] == 'upstart'
+  if node['rabbitmq']['job_control'] == 'upstart' && node['rabbitmq']['manage_service']
     # We start with stock init.d, remove it if we're not using init.d, otherwise leave it alone
     service node['rabbitmq']['service_name'] do
       action [:stop]
@@ -80,26 +90,17 @@ when 'debian'
       mode 0644
       variables(:max_file_descriptors => node['rabbitmq']['max_file_descriptors'])
     end
-
-    service node['rabbitmq']['service_name'] do
-      provider Chef::Provider::Service::Upstart
-      action [:enable, :start]
-      # restart_command "stop #{node['rabbitmq']['service_name']} && start #{node['rabbitmq']['service_name']}"
-    end
-  end
-
-  if node['rabbitmq']['job_control'] == 'initd'
-    service node['rabbitmq']['service_name'] do
-      supports :status => true, :restart => true
-      action [:enable, :start]
-    end
   end
 
 when 'rhel', 'fedora'
+
+  # socat is a package dependency of rabbitmq-server
+  package 'socat'
+
   # This is needed since Erlang Solutions' packages provide "esl-erlang"; this package just requires "esl-erlang" and provides "erlang".
   if node['erlang']['install_method'] == 'esl'
     remote_file "#{Chef::Config[:file_cache_path]}/esl-erlang-compat.rpm" do
-      source 'https://github.com/jasonmcintosh/esl-erlang-compat/blob/master/rpmbuild/RPMS/noarch/esl-erlang-compat-R14B-1.el6.noarch.rpm?raw=true'
+      source "#{node['rabbitmq']['esl-erlang_package_url']}#{node['rabbitmq']['esl-erlang_package']}"
     end
     rpm_package "#{Chef::Config[:file_cache_path]}/esl-erlang-compat.rpm"
   end
@@ -107,17 +108,17 @@ when 'rhel', 'fedora'
   if node['rabbitmq']['use_distro_version']
     package 'rabbitmq-server' do
       action :install
-      version node['rabbitmq']['version']
+      version node['rabbitmq']['version'] if node['rabbitmq']['pin_distro_version']
     end
   else
     # We need to download the rpm
-    rpm_package = "https://www.rabbitmq.com/releases/rabbitmq-server/v#{node['rabbitmq']['version']}/rabbitmq-server-#{node['rabbitmq']['version']}-1.noarch.rpm"
+    rpm_package = "#{node['rabbitmq']['rpm_package_url']}#{node['rabbitmq']['rpm_package']}"
 
-    remote_file "#{Chef::Config[:file_cache_path]}/rabbitmq-server-#{node['rabbitmq']['version']}-1.noarch.rpm" do
+    remote_file "#{Chef::Config[:file_cache_path]}/#{node['rabbitmq']['rpm_package']}" do
       source rpm_package
       action :create_if_missing
     end
-    rpm_package "#{Chef::Config[:file_cache_path]}/rabbitmq-server-#{node['rabbitmq']['version']}-1.noarch.rpm"
+    rpm_package "#{Chef::Config[:file_cache_path]}/#{node['rabbitmq']['rpm_package']}"
   end
 
 when 'suse'
@@ -130,13 +131,13 @@ when 'suse'
   end
   package 'rabbitmq-server' do
     action :install
-    version node['rabbitmq']['version']
+    version node['rabbitmq']['version'] if node['rabbitmq']['pin_distro_version']
   end
 
 when 'smartos'
-  package 'rabbitmq'do
+  package 'rabbitmq' do
     action :install
-    version node['rabbitmq']['version']
+    version node['rabbitmq']['version'] if node['rabbitmq']['pin_distro_version']
   end
 
   service 'epmd' do
@@ -166,30 +167,40 @@ template "#{node['rabbitmq']['config_root']}/rabbitmq-env.conf" do
   owner 'root'
   group 'root'
   mode 00644
-  notifies :restart, "service[#{node['rabbitmq']['service_name']}]", :immediately
+  notifies :restart, "service[#{node['rabbitmq']['service_name']}]"
 end
 
 template "#{node['rabbitmq']['config']}.config" do
-  sensitive true
+  sensitive true if Gem::Version.new(Chef::VERSION.to_s) >= Gem::Version.new('11.14.2')
   source 'rabbitmq.config.erb'
   cookbook node['rabbitmq']['config_template_cookbook']
   owner 'root'
   group 'root'
   mode 00644
   variables(
-    :kernel => format_kernel_parameters
-    )
-  notifies :restart, "service[#{node['rabbitmq']['service_name']}]", :immediately
+    :kernel => format_kernel_parameters,
+    :ssl_versions => (format_ssl_versions if node['rabbitmq']['ssl_versions']),
+    :ssl_ciphers => (format_ssl_ciphers if node['rabbitmq']['ssl_ciphers'])
+  )
+  notifies :restart, "service[#{node['rabbitmq']['service_name']}]"
 end
 
-if File.exist?(node['rabbitmq']['erlang_cookie_path']) && File.readable?((node['rabbitmq']['erlang_cookie_path']))
-  existing_erlang_key =  File.read(node['rabbitmq']['erlang_cookie_path']).strip
-else
-  existing_erlang_key = ''
+template "/etc/default/#{node['rabbitmq']['service_name']}" do
+  source 'default.rabbitmq-server.erb'
+  owner 'root'
+  group 'root'
+  mode 00644
+  notifies :restart, "service[#{node['rabbitmq']['service_name']}]"
 end
 
-if node['rabbitmq']['cluster'] && (node['rabbitmq']['erlang_cookie'] != existing_erlang_key)
-  log "stop #{node['rabbitmq']['serice_name']} to change erlang cookie" do
+existing_erlang_key = if File.exist?(node['rabbitmq']['erlang_cookie_path']) && File.readable?((node['rabbitmq']['erlang_cookie_path']))
+                        File.read(node['rabbitmq']['erlang_cookie_path']).strip
+                      else
+                        ''
+                      end
+
+if node['rabbitmq']['clustering']['enable'] && (node['rabbitmq']['erlang_cookie'] != existing_erlang_key)
+  log "stop #{node['rabbitmq']['service_name']} to change erlang cookie" do
     notifies :stop, "service[#{node['rabbitmq']['service_name']}]", :immediately
   end
 
@@ -209,6 +220,15 @@ if node['rabbitmq']['cluster'] && (node['rabbitmq']['erlang_cookie'] != existing
   end
 end
 
-service node['rabbitmq']['service_name'] do
-  action [:enable, :start]
+if node['rabbitmq']['manage_service']
+  service node['rabbitmq']['service_name'] do
+    action [:enable, :start]
+    supports :status => true, :restart => true
+    provider Chef::Provider::Service::Upstart if node['rabbitmq']['job_control'] == 'upstart'
+    provider Chef::Provider::Service::Init if node['rabbitmq']['job_control'] == 'init'
+  end
+else
+  service node['rabbitmq']['service_name'] do
+    action :nothing
+  end
 end
